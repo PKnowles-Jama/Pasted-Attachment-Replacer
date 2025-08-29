@@ -5,6 +5,7 @@ from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread
 from PyQt6.QtGui import QIcon, QPixmap
 from PermanentHeader import permanent_header
 from JamaLogin import JamaLogin
+from Functions import update_jama_attachments
 
 # Custom stream class to redirect stdout (print statements) to the QTextEdit widget
 class Stream(QObject):
@@ -28,16 +29,16 @@ class Worker(QObject):
     """
     finished = pyqtSignal()
     
-    def __init__(self, basic_oauth, jama_username, jama_password, project_api_id, custom_prefix, url, attachment_item_type_id, delete_downloads):
+    def __init__(self, basic_oauth, jama_username, jama_password, project_api_id, url, attachment_item_type_id, file_path):
         super().__init__()
-        self.basic_oauth = basic_oauth  # New parameter
+        self.basic_oauth = basic_oauth
         self.jama_username = jama_username
         self.jama_password = jama_password
         self.project_api_id = project_api_id
-        self.custom_prefix = custom_prefix
         self.url = url
         self.attachment_item_type_id = attachment_item_type_id
-        self.delete_downloads = delete_downloads
+        self.file_path = file_path
+
 
     def run(self):
         """
@@ -47,12 +48,17 @@ class Worker(QObject):
         try:
             # Construct the V2 URL
             if not self.url.endswith("/"):
-                jama_base_url_v2 = self.url + "/rest/v2/"
+                jama_base_url = self.url
             else:
-                jama_base_url_v2 = self.url + "rest/v2/"
+                jama_base_url = self.url
             
-            # TODO Execute login
-            # TODO Execute logic
+            # Execute JamaLogin
+            session = JamaLogin(self.basic_oauth, self.jama_username, self.jama_password, jama_base_url)
+            
+            # Execute update_jama_attachments
+            # Strip trailing slash from url to prevent double slashes
+            clean_url = self.url.rstrip('/')
+            update_jama_attachments(clean_url, session, int(self.project_api_id), int(self.attachment_item_type_id), self.file_path, self.basic_oauth)
 
         except Exception as e:
             print(f"An error occurred during the update sequence: {e}")
@@ -70,7 +76,7 @@ class AttachmentReplacer(QWidget):
         screen = QApplication.primaryScreen() # Scrape the correct screen to open on
         screen_geometry = screen.geometry() # Determine the primary screen's geometry
         window_width = 800 # Width of the app
-        window_height = 600 # Height of the app
+        window_height = 500 # Height of the app
         x = (screen_geometry.width() - window_width) // 2 # Calculate the halfway width
         y = (screen_geometry.height() - window_height) // 2 # Calculate the halfway height
         self.setGeometry(x, y, window_width, window_height) # Set the app's opening location and size
@@ -194,7 +200,7 @@ class AttachmentReplacer(QWidget):
         self.save_logs_button.hide()
         
         # Add the readout log area
-        self.readout_label = QLabel("Readout Log:")
+        self.readout_label = QLabel("Log:")
         self.readout_log = QTextEdit()
         self.readout_log.setReadOnly(True)
 
@@ -218,7 +224,7 @@ class AttachmentReplacer(QWidget):
         #   Only allow user to select the previously determined file type
         #
         file_dialog = QFileDialog()
-        file_path, _ = file_dialog.getOpenFileName(self, "Select File", "Files (*.xlsx)", )
+        file_path, _ = file_dialog.getOpenFileName(self, "Select File", "", "Excel files (*.xlsx)")
         if file_path:
             self.file_path = file_path
             self.file_path_label.setText(f"Selected: {self.file_path}")
@@ -252,22 +258,19 @@ class AttachmentReplacer(QWidget):
         jama_username = self.username_input.text()
         jama_password = self.password_input.text()
         project_api_id = self.project_api_id_input.text()
-        custom_prefix = self.custom_prefix_input.text()
         url = self.URL_input.text()
         attachment_item_type_id = self.attachement_api_id_input.text()
-        delete_downloads = self.delete_downloads_input.isChecked()
 
         # Create the thread and worker objects
         self.thread = QThread()
         self.worker = Worker(
-            basic_oauth=basic_oauth,  # Pass the new argument
+            basic_oauth=basic_oauth,
             jama_username=jama_username,
             jama_password=jama_password,
             project_api_id=project_api_id,
-            custom_prefix=custom_prefix,
             url=url,
             attachment_item_type_id=attachment_item_type_id,
-            delete_downloads=delete_downloads
+            file_path=self.file_path
         )
 
         # Move the worker object to the thread
