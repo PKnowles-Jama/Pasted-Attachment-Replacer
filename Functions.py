@@ -3,6 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import os
+import json
 from docx import Document
 from docx.shared import Inches, RGBColor
 from docx.oxml.shared import OxmlElement, qn
@@ -25,9 +26,12 @@ def update_jama_attachments(url, session, project_ID, attachment_ID, file_path, 
         # Ensure the URL is clean and doesn't have a trailing slash
         clean_url = url.rstrip('/')
 
-        # Use a consistent API path for all core API calls, which is 'rest/latest'.
-        # The session is already authenticated and can access this endpoint.
-        api_path = 'rest/latest'
+        # Use the correct API path based on the working curl command
+        api_path = 'rest/v1'
+
+        # Create the DOWNLOADED folder if it doesn't exist
+        download_folder = "DOWNLOADED"
+        os.makedirs(download_folder, exist_ok=True)
 
         # Step 1: Get all items in the specified project using pagination
         print("Fetching all items from the specified project...")
@@ -97,50 +101,94 @@ def update_jama_attachments(url, session, project_ID, attachment_ID, file_path, 
                     processed_items.append({'ID': global_id, 'URL': f'{clean_url}/perspective.req#/items/{api_id}?projectId={project_ID}', 'Status': 'Skipped'})
                     continue
 
-                # Find the attachment ID within the HTML URL
-                attachment_url = img_tag['src']
-                match = re.search(r'attachment/(\d+)', attachment_url)
+                image_download_url = img_tag['src']
+                
+                # Use a regex to extract the abstract item ID from the URL
+                match = re.search(r'attachment/(\d+)', image_download_url)
                 if not match:
-                    print("Could not find attachment ID in the image URL. Skipping.")
+                    print("Could not find abstract item ID in the image URL. Skipping.")
                     processed_items.append({'ID': global_id, 'URL': f'{clean_url}/perspective.req#/items/{api_id}?projectId={project_ID}', 'Status': 'Skipped'})
                     continue
+                
+                abstract_item_id = match.group(1)
 
-                old_attachment_id = match.group(1)
+                # Attempt to download the file content from the official API endpoint
+                print(f"Downloading old attachment with ID: {abstract_item_id}")
+                file_download_url = f'{clean_url}/{api_path}/attachments/{abstract_item_id}/file'
                 
-                # Use that attachment ID to download the attachment
-                print(f"Downloading old attachment with ID: {old_attachment_id}")
-                file_download_url = f'{clean_url}/{api_path}/attachments/{old_attachment_id}/file'
-                file_response = session.get(file_download_url, stream=True)
-                file_response.raise_for_status()
-                
-                content_disposition = file_response.headers.get('Content-Disposition', '')
-                filename = re.findall(r'filename="([^"]+)"', content_disposition)[0]
-                
-                temp_file_path = f"temp_{filename}"
-                with open(temp_file_path, 'wb') as f:
-                    for chunk in file_response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                try:
+                    file_response = session.get(file_download_url, stream=True)
+                    file_response.raise_for_status()
+
+                    # Process the downloaded file content
+                    content_disposition = file_response.headers.get('Content-Disposition', '')
+                    filename_list = re.findall(r'filename="([^"]+)"', content_disposition)
+                    
+                    if filename_list:
+                        filename = filename_list[0]
+                    else:
+                        filename = os.path.basename(image_download_url)
+                        print(f"Warning: Filename not found in header. Using URL as fallback: {filename}")
+
+                    temp_file_path = os.path.join(download_folder, filename)
+                    with open(temp_file_path, 'wb') as f:
+                        for chunk in file_response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                            
+                except requests.exceptions.HTTPError as http_err:
+                    if http_err.response.status_code == 404:
+                        print(f"Official API download failed (404). Falling back to direct URL download.")
+                        
+                        # Fallback to direct URL download using a new session
+                        direct_download_url = f"{clean_url}/{image_download_url.lstrip('/')}"
+                        file_response = session.get(direct_download_url, stream=True)
+                        file_response.raise_for_status()
+                        
+                        filename = os.path.basename(direct_download_url)
+                        temp_file_path = os.path.join(download_folder, filename)
+                        with open(temp_file_path, 'wb') as f:
+                            for chunk in file_response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                    else:
+                        raise http_err
 
                 # Rename the attachment
                 name, extension = os.path.splitext(filename)
                 new_filename = f"{name}_{enumeration:03d}{extension}"
-                
-                # Upload the newly named file
-                print(f"Uploading new attachment: {new_filename}")
-                upload_url = f'{clean_url}/{api_path}/attachments'
-                file_payload = {'file': (new_filename, open(temp_file_path, 'rb'), 'application/octet-stream')}
+
+                # Step A: Create a new attachment item (metadata)
+                print(f"Creating new attachment item for: {new_filename}")
+                create_attachment_url = f'{clean_url}/{api_path}/projects/{project_ID}/attachments'
                 metadata_payload = {
-                    'project': project_ID,
-                    'itemType': attachment_ID
+                    'fields': {
+                        'name': new_filename,
+                        'description': 'Attachment renamed and re-uploaded via API script.'
+                    }
                 }
-                upload_response = session.post(upload_url, files=file_payload, data=metadata_payload)
-                upload_response.raise_for_status()
-                new_attachment_id = upload_response.json()['data']['id']
                 
-                # Update the HTML in the description field
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                }
+                create_response = session.post(create_attachment_url, data=json.dumps(metadata_payload), headers=headers)
+                create_response.raise_for_status()
+                new_attachment_id = create_response.json()['meta']['id']
+                print(f"Attachment item created with ID: {new_attachment_id}")
+
+                # Step B: Upload the renamed file content to the newly created attachment item
+                print(f"Uploading file content for: {new_filename}")
+                upload_file_url = f'{clean_url}/{api_path}/attachments/{new_attachment_id}/file'
+                
+                with open(temp_file_path, 'rb') as f:
+                    upload_response = session.put(upload_file_url, data=f, headers=session.headers)
+                    upload_response.raise_for_status()
+                
+                print("File content successfully uploaded.")
+
+                # Step C: Update the HTML in the description field
                 print("Updating the item's description field...")
-                new_attachment_url = f'/{api_path}/attachments/{new_attachment_id}'
-                new_html = rich_text_html.replace(attachment_url, new_attachment_url)
+                new_attachment_url = f'{clean_url}/attachment/{new_attachment_id}/{new_filename}'
+                new_html = rich_text_html.replace(image_download_url, new_attachment_url)
                 
                 update_url = f'{clean_url}/{api_path}/items/{api_id}'
                 update_payload = {'fields': {'description': new_html}}
